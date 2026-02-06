@@ -1,0 +1,11 @@
+# ===== venv =====
+**/.venv/
+
+# ===== data =====
+**/data/
+
+# ===== output =====
+**/output/
+
+# ===== python cache =====
+**/__pycache__/
