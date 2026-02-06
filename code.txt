@@ -1,0 +1,220 @@
+config.py
+
+FUZZY_THRESHOLD = 90
+
+COLUMNS = [
+    "Subsidiary",
+    "Country ISO-2 Code",
+    "Entity Registration Number",
+    "Registered Address"
+]
+
+---
+
+loader.py
+
+import pandas as pd
+
+from config import COLUMNS
+
+
+def load_excel(path):
+    df = pd.read_excel(path)
+    df = df[COLUMNS]
+    return df
+
+---
+
+normalizer.py
+
+import re
+
+import pandas as pd
+
+
+def normalize_text(value):
+  if pd.isna(value):
+    return ""
+  value = str(value).strip()
+  value = re.sub(r"\s+", " ", value)
+  return value
+
+def normalize_df(df):
+  df = df.copy()
+  for col in df.columns:
+    df[col] = df[col].apply(normalize_text)
+  return df
+
+---
+
+matcher.py
+
+import hashlib
+
+from rapidfuzz import fuzz
+
+
+def row_hash(row):
+  """
+  Hash only relatively stable fields.
+  Address is excluded intentionally.
+  """
+  values = [
+    row["Subsidiary"],
+    row["Country ISO-2 Code"],
+    row["Entity Registration Number"]
+  ]
+  joined = "|".join(values)
+  return hashlib.sha256(joined.encode()).hexdigest()
+
+
+def compute_hashes(df):
+  df = df.copy()
+  df["row_hash"] = df.apply(row_hash, axis=1)
+  return df
+
+
+def similarity_score(row_a, row_b):
+  """
+  Business-aligned similarity scoring.
+  """
+
+  reg_a = row_a["Entity Registration Number"]
+  reg_b = row_b["Entity Registration Number"]
+
+  # If registration number matches, we consider it the same entity
+  if reg_a and reg_a == reg_b:
+    return 100.0
+
+  name_score = fuzz.token_sort_ratio(
+    row_a["Subsidiary"], row_b["Subsidiary"]
+  )
+
+  address_score = fuzz.token_sort_ratio(
+    row_a["Registered Address"], row_b["Registered Address"]
+  )
+
+  iso_score = (
+    100 if row_a["Country ISO-2 Code"] == row_b["Country ISO-2 Code"] else 0
+  )
+
+  # Weighted average based on change frequency
+  return (
+    name_score * 0.45 +
+    address_score * 0.40 +
+    iso_score * 0.15
+  )
+
+---
+
+differ.py
+
+import pandas as pd
+
+from matcher import similarity_score
+
+
+def diff_entities(old_df, new_df):
+    added = []
+    removed = []
+    modified = []
+
+    matched_old = set()
+    matched_new = set()
+
+    # Phase 1: Hash matches
+    hash_map_old = {row["row_hash"]: idx for idx, row in old_df.iterrows()}
+    hash_map_new = {row["row_hash"]: idx for idx, row in new_df.iterrows()}
+
+    for h in set(hash_map_old) & set(hash_map_new):
+        matched_old.add(hash_map_old[h])
+        matched_new.add(hash_map_new[h])
+
+    # Phase 2: Fuzzy matching
+    for old_idx, old_row in old_df.iterrows():
+        if old_idx in matched_old:
+            continue
+
+        best_match = None
+        best_score = 0
+
+        for new_idx, new_row in new_df.iterrows():
+            if new_idx in matched_new:
+                continue
+
+            score = similarity_score(old_row, new_row)
+            if score > best_score:
+                best_score = score
+                best_match = new_idx
+
+        if best_score >= 85:
+            matched_old.add(old_idx)
+            matched_new.add(best_match)
+
+            changes = {}
+            for col in old_df.columns:
+                if col == "row_hash":
+                    continue
+                if old_row[col] != new_df.loc[best_match, col]:
+                    changes[col] = {
+                        "old": old_row[col],
+                        "new": new_df.loc[best_match, col]
+                    }
+
+            if changes:
+                modified.append(changes)
+        else:
+            removed.append(old_row)
+
+    # Phase 3: Additions
+    for new_idx, new_row in new_df.iterrows():
+        if new_idx not in matched_new:
+            added.append(new_row)
+
+    return (
+        pd.DataFrame(added),
+        pd.DataFrame(removed),
+        pd.DataFrame(format_modified(modified))
+    )
+
+
+def format_modified(modified):
+    rows = []
+    for change in modified:
+        for field, vals in change.items():
+            rows.append({
+                "Field": field,
+                "Old Value": vals["old"],
+                "New Value": vals["new"]
+            })
+    return rows
+
+
+---
+
+main.py
+
+from differ import diff_entities
+from loader import load_excel
+from matcher import compute_hashes
+from normalizer import normalize_df
+
+
+def run():
+    old_df = load_excel("data/prev.xlsx")
+    new_df = load_excel("data/curr.xlsx")
+
+    old_df = normalize_df(old_df)
+    new_df = normalize_df(new_df)
+
+    old_df = compute_hashes(old_df)
+    new_df = compute_hashes(new_df)
+
+    added, removed, modified = diff_entities(old_df, new_df)
+
+    added.to_excel("output/added_entities.xlsx", index=False)
+    removed.to_excel("output/removed_entities.xlsx", index=False)
+    modified.to_excel("output/modified_entities.xlsx", index=False)
+
+if __name__ == "__main__":
+    run()
